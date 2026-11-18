@@ -1,0 +1,6 @@
+id=kabuk-sunucu
+name=Kabuk Sunucu
+version=1.0.0
+versionCode=6
+author=Kabuk
+description=Kabuk Sunucu servisleri (chroot, runit, sarj siniri, watchdog). Devre disi birakmak tum uzaktan erisimi bir sonraki acilista kapatir.
