@@ -1,0 +1,10 @@
+#!/bin/sh
+# Kabuk Ajan (sohbet arayuzu -> Claude Code): dev olarak, YALNIZ tailnet adresinde.
+exec 2>&1
+. /etc/kabuk/env
+if [ "$TS_MODE" = userspace ]; then ip=127.0.0.1
+else until ip=$(kabuk-tsip 4) && [ -n "$ip" ]; do sleep 3; done; fi
+cd /home/dev
+exec env -i HOME=/home/dev USER=dev LOGNAME=dev SHELL=/bin/bash LANG=C.UTF-8 TERM=xterm-256color \
+  PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin BIND="$ip" PORT="${AGENT_PORT:-8787}" \
+  /usr/sbin/chpst -u dev:dev:aid_inet:aid_net_raw node /opt/kabuk-agent/server.js
