@@ -1,0 +1,9 @@
+#!/bin/sh
+# Taildrop alici: tailnet'ten gonderilen dosyalar -> /home/dev/Taildrop
+exec 2>&1
+D=/home/dev/Taildrop
+mkdir -p "$D" && chown dev:dev "$D" && chmod 700 "$D"
+while :; do
+  tailscale --socket=/run/tailscale/tailscaled.sock file get --wait --conflict=rename "$D" || sleep 10
+  chown -R dev:dev "$D"
+done
