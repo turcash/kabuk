@@ -1,0 +1,39 @@
+#!/system/bin/sh
+# Magisk service.sh tarafindan arka planda calistirilir (kilit acilmadan, uygulama acilmadan).
+# Boot'u bekler -> Android ayarlari -> servisler -> watchdog (duserse 10 sn sonra yeniden).
+BASE=/data/kabuk
+mkdir -p $BASE/log $BASE/run
+
+main() {
+  echo "== kabuk-boot $(date '+%F %T') boot_id=$(cat /proc/sys/kernel/random/boot_id) uptime=$(cut -d' ' -f1 /proc/uptime)s"
+  until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
+  echo "boot_completed: uptime=$(cut -d' ' -f1 /proc/uptime)s"
+
+  # Fail-safe: watchdog calismiyorken sarj asla kapali kalmasin.
+  echo 0 > /sys/class/power_supply/battery/input_suspend 2>/dev/null
+
+  [ -f $BASE/DISABLED ] && { echo "acil durdurma aktif; cikiliyor"; return 0; }
+  /system/bin/sh $BASE/bin/kabuk tweaks
+  /system/bin/sh $BASE/bin/kabuk start
+  echo "servisler hazir: uptime=$(cut -d' ' -f1 /proc/uptime)s"
+
+  while [ ! -f $BASE/DISABLED ]; do
+    /system/bin/sh $BASE/bin/kabuk watchdog
+    echo "watchdog cikti rc=$? $(date '+%F %T')"
+    echo 0 > /sys/class/power_supply/battery/input_suspend 2>/dev/null
+    sleep 10
+  done
+  echo "kabuk-boot bitti $(date '+%F %T')"
+}
+
+# Log yazici: her satirda dosyayi yeniden acar (dondurmeye dayanikli). Cikti dosyaya degil
+# boruya gider: 'cmd/settings/device_config' fd'leri system_server'a aktarir ve SELinux
+# system_server'in /data/kabuk dosyalarina yazmasina izin vermez ("Failed transaction").
+logw() { while IFS= read -r l; do echo "$l" >> $BASE/log/boot.log; done; }
+
+# Tek kopya. Not: mksh 'exec 8>dosya' ile acilan fd'lere close-on-exec koyar; harici flock
+# goremez -> kilidi alt kabuk yonlendirmesiyle al.
+(
+  flock -n 8 || { echo "kabuk-boot zaten calisiyor"; exit 0; }
+  main
+) 8>$BASE/run/boot.lock 2>&1 </dev/null | logw

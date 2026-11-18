@@ -1,0 +1,820 @@
+#!/system/bin/sh
+# Kabuk Sunucu runtime - gercek chroot (Alpine arm64), root gerektirir.
+# kabuk enter [kullanici] | run <kullanici> <komut> | mount | umount [force] | status | install
+#       backup | restore <dosya> | test | deploy <kaynak> | tweaks | start | stop | restart
+#       sv <komut> [servis] | watchdog | health | charge | notify <metin>
+set -u
+
+BASE=${KABUK_BASE:-/data/kabuk}
+R=$BASE/rootfs
+BACKUPS=$BASE/backups
+LOGDIR=$BASE/log
+RUN=$BASE/run
+CONF=$BASE/etc/kabuk.conf
+LOCK=$BASE/.mount.lock
+MODDIR=/data/adb/modules/kabuk-sunucu
+CPUSET=/dev/cpuset/kabuk
+BAT=/sys/class/power_supply/battery
+USERNAME=dev
+USER_UID=8000
+PKGS="bash coreutils procps util-linux-misc shadow sudo ca-certificates tzdata runit \
+nodejs npm git openssh openssh-sftp-server mosh tmux ripgrep python3 curl jq \
+less nano libgcc libstdc++ ncurses-terminfo-base rsync file iproute2 tailscale ttyd ntfy \
+samba-server samba-common-tools samba-client"
+
+die() { echo "kabuk: $*" >&2; exit 1; }
+log() { echo "[kabuk $(date '+%F %T')] $*"; }
+
+[ "$(id -u)" = 0 ] || die "root gerekli (su -c kabuk ...)"
+
+# Uygulama icinden cagrilan su ayri bir mount namespace'te olabilir; mount'larin
+# tum sistemde gorunmesi icin init'in namespace'ine gec.
+if [ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]; then
+  exec nsenter -t 1 -m -- /system/bin/sh "$0" "$@"
+fi
+
+mkdir -p "$BASE" "$BACKUPS" "$LOGDIR" "$RUN" "$BASE/etc"
+chmod 755 "$BASE"
+
+# --- ayarlar ----------------------------------------------------------------
+CHARGE_LIMIT=1; CHARGE_STOP=80; CHARGE_START=75; CHARGE_FAILSAFE=70
+HOT_C=40; HOT_STOP_CHARGE_C=45
+WAKELOCK=auto            # auto | always | off
+SERVICES="tailscaled sshd taildrop ttyd ntfy kabuk-agent"   # runit altinda calisacak servisler
+SSH_LISTEN=""            # bos = tailscale0 adresi (onerilen); LAN/internete ACMAYIN
+TS_MODE=tun              # tun | userspace
+TS_HOSTNAME=note10
+FIREWALL=1
+FULL_ROOT=0            # 1 = dev parolasiz sudo + `android` komutu (Android root). Kullanici istegiyle.
+TTYD_PORT=7681
+SESSION=claude
+NET_RESET_AFTER=300
+NTFY_URL=""              # Asama 4: ornek http://100.x.y.z:8090/kabuk
+[ -f "$CONF" ] && . "$CONF"
+
+is_mnt() { grep -q " $1 " /proc/mounts; }
+
+# --- mount yonetimi (idempotent) -------------------------------------------
+do_mount() {
+  [ -x "$R/bin/busybox" ] || die "rootfs yok: $R (once 'kabuk install')"
+  (
+    flock 9
+    for d in proc sys dev tmp; do mkdir -p "$R/$d"; done
+    # Android /data'yi 'nosuid' baglar -> sudo calismaz. Yalniz /usr/bin'i (sudo burada) suid ile
+    # bagla: calisan oturumlari durdurmadan devreye girer. FULL_ROOT=0 iken kaldirilir.
+    if [ "${FULL_ROOT:-0}" = 1 ]; then
+      is_mnt "$R/usr/bin" || { mount --bind "$R/usr/bin" "$R/usr/bin" && mount -o remount,bind,suid "$R/usr/bin"; }
+    elif is_mnt "$R/usr/bin"; then
+      umount "$R/usr/bin" 2>/dev/null
+    fi
+    is_mnt "$R/proc" || mount -t proc proc "$R/proc"
+    is_mnt "$R/sys"  || mount -t sysfs -o ro sysfs "$R/sys"
+    if ! is_mnt "$R/dev"; then
+      # Host /dev'i kirletmemek icin chroot'a ozel kucuk bir /dev kur.
+      mount -t tmpfs -o mode=755,size=1m,nosuid tmpfs "$R/dev"
+      for n in null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 tty:5:0 ptmx:5:2; do
+        name=${n%%:*}; rest=${n#*:}
+        mknod -m 666 "$R/dev/$name" c ${rest%%:*} ${rest#*:}
+      done
+      mkdir -p "$R/dev/pts" "$R/dev/shm" "$R/dev/net"
+      mount --bind /dev/pts "$R/dev/pts"
+      mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$R/dev/shm"
+      # toybox 'mount --bind' karakter aygitini loop sanir; dogrudan mknod (10:200).
+      [ -c /dev/tun ] && mknod -m 600 "$R/dev/net/tun" c 10 200
+      ln -s /proc/self/fd "$R/dev/fd"
+      ln -s /proc/self/fd/0 "$R/dev/stdin"
+      ln -s /proc/self/fd/1 "$R/dev/stdout"
+      ln -s /proc/self/fd/2 "$R/dev/stderr"
+    fi
+    is_mnt "$R/tmp" || mount -t tmpfs -o mode=1777,size=1g,nosuid,nodev tmpfs "$R/tmp"
+    # Telefon depolamasi (dosya paylasimi/erisim icin): Android /sdcard -> chroot /mnt/telefon
+    if [ -d /data/media/0 ]; then
+      mkdir -p "$R/mnt/telefon"
+      is_mnt "$R/mnt/telefon" || mount --bind /data/media/0 "$R/mnt/telefon"
+    fi
+    # USB aygitlari: chroot'un host USB veriyolunu gormesini saglar (istege bagli).
+    if [ -d /dev/bus/usb ]; then
+      mkdir -p "$R/dev/bus/usb"
+      is_mnt "$R/dev/bus/usb" || mount --bind /dev/bus/usb "$R/dev/bus/usb"
+    fi
+  ) 9>"$LOCK"
+}
+
+# chroot icinde calisan surecler (tek 'ls': PID basina readlink ~1000 surecte saniyeler suruyordu)
+users_of_rootfs() {
+  ls -l /proc/[0-9]*/root 2>/dev/null | grep -E -- "-> $R(/|\$)" | sed -E 's|.*/proc/([0-9]+)/root.*|\1|'
+}
+
+do_umount() {
+  (
+    flock 9
+    if [ -n "$(users_of_rootfs)" ] && [ "${1:-}" != force ]; then
+      exit 0   # baska oturum/servis hala icerde; mount'lara dokunma
+    fi
+    for m in $(grep " $R/" /proc/mounts | awk '{print $2}' | sort -r); do
+      umount "$m" 2>/dev/null || umount -l "$m"
+    done
+  ) 9>"$LOCK"
+}
+
+# Ayri UTS namespace: chroot icinde hostname 'note10' (istem yanlis cihazi gostermesin);
+# Android'in kendi hostname'i degismez.
+uts() { unshare -u /system/bin/sh -c 'hostname "$0" 2>/dev/null; exec "$@"' "${TS_HOSTNAME:-note10}" "$@"; }
+
+chroot_env() {
+  u=$1; shift
+  if [ "$u" = root ]; then h=/root; else h=/home/$u; fi
+  uts chroot "$R" /usr/bin/env -i HOME="$h" USER="$u" LOGNAME="$u" TERM="${TERM:-xterm-256color}" \
+    LANG=C.UTF-8 TZ="$(getprop persist.sys.timezone)" \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
+}
+# busybox 'su -l -c' /etc/profile'i okutmuyor -> acikca yukle.
+as_user() { chroot_env root /bin/su -l "$USERNAME" -c ". /etc/profile >/dev/null 2>&1; $1"; }
+
+do_enter() {
+  u=${1:-$USERNAME}
+  do_mount
+  if [ "$u" = root ]; then chroot_env root /bin/bash -l
+  else chroot_env root /bin/su -l "$u"; fi
+  rc=$?
+  do_umount
+  return $rc
+}
+
+do_run() {
+  u=$1; shift
+  do_mount
+  if [ "$u" = root ]; then chroot_env root /bin/sh -lc "$*"
+  else as_user "$*"; fi
+  rc=$?
+  do_umount
+  return $rc
+}
+
+# --- kurulum ---------------------------------------------------------------
+do_install() {
+  if [ ! -x "$R/bin/busybox" ]; then
+    tarball=${KABUK_TARBALL:-}; sum=${KABUK_SHA256:-}
+    [ -n "$tarball" ] || die "KABUK_TARBALL=<alpine-minirootfs-*.tar.gz> ve KABUK_SHA256 gerekli"
+    if [ -n "$sum" ]; then
+      echo "$sum  $tarball" | sha256sum -c - >/dev/null || die "sha256 uyusmuyor"
+    fi
+    log "rootfs aciliyor -> $R"
+    mkdir -p "$R"; tar -xzf "$tarball" -C "$R" || die "tar hatasi"
+  fi
+
+  printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > "$R/etc/resolv.conf"
+  echo note10 > "$R/etc/hostname"
+  grep -q note10 "$R/etc/hosts" || echo "127.0.1.1 note10" >> "$R/etc/hosts"
+
+  do_mount
+  log "paketler kuruluyor"
+  chroot_env root /bin/sh -c "apk update -q && apk add -q $PKGS" || die "apk hatasi"
+
+  # Android "paranoid network": soket acmak icin AID_INET (3003) grubu gerekir.
+  chroot_env root /bin/sh -c '
+    grep -q "^aid_inet:" /etc/group    || echo "aid_inet:x:3003:" >> /etc/group
+    grep -q "^aid_net_raw:" /etc/group || echo "aid_net_raw:x:3004:" >> /etc/group
+    addgroup root aid_inet 2>/dev/null; addgroup root aid_net_raw 2>/dev/null; true'
+
+  if ! chroot_env root /bin/sh -c "id $USERNAME" >/dev/null 2>&1; then
+    log "kullanici: $USERNAME (uid $USER_UID)"
+    chroot_env root /bin/sh -c "
+      adduser -D -u $USER_UID -s /bin/bash $USERNAME &&
+      addgroup $USERNAME aid_inet && addgroup $USERNAME aid_net_raw && addgroup $USERNAME wheel &&
+      usermod -p "*" $USERNAME"
+  fi
+  chroot_env root /bin/sh -c "
+    # busybox adduser ev dizinini setgid (2700) olusturuyor; alt dizinlere de bulasiyor.
+    find /home/$USERNAME -type d -perm -2000 -exec chmod g-s {} +
+    chmod go-rwx /home/$USERNAME
+    # '!' (passwd -l) = kilitli hesap: PAM'siz OpenSSH anahtarla bile reddeder. '*' = parola yok, anahtar olur.
+    grep -q '^$USERNAME:!' /etc/shadow && usermod -p '*' $USERNAME
+    echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel && chmod 440 /etc/sudoers.d/wheel
+    ln -sf /usr/share/zoneinfo/$(getprop persist.sys.timezone) /etc/localtime; true"
+  write_profile
+  write_session_helper
+
+  log "Claude Code (resmi native installer) -> $USERNAME"
+  if ! as_user 'command -v claude' >/dev/null 2>&1; then
+    as_user 'curl -fsSL https://claude.ai/install.sh | bash' >/dev/null || die "claude kurulamadi"
+  fi
+  as_user 'claude --version' || die "claude calismiyor"
+  sv_sync
+  setup_hooks
+  do_umount
+  log "kurulum tamam"
+}
+
+# Claude Code hook'lari: izin istegi/bildirim ve is bitimi -> kabuk-notify -> ntfy (tailnet).
+# Mevcut ayarlar korunur (jq ile birlestirilir); zaten varsa dokunulmaz.
+setup_hooks() {
+  as_user '
+    f=$HOME/.claude/settings.json; mkdir -p $HOME/.claude; [ -s $f ] || echo "{}" > $f
+    if ! grep -q kabuk-notify $f; then
+      jq ".hooks.Notification = ((.hooks.Notification // []) + [{\"hooks\":[{\"type\":\"command\",\"command\":\"kabuk-notify notification\"}]}])
+        | .hooks.Stop = ((.hooks.Stop // []) + [{\"hooks\":[{\"type\":\"command\",\"command\":\"kabuk-notify stop\"}]}])" $f > $f.new && mv $f.new $f
+    fi
+    chmod 600 $f; chmod 700 $HOME/.claude'
+}
+
+write_profile() {
+  cat > "$R/etc/profile.d/kabuk.sh" <<'EOF'
+# Alpine /etc/profile PATH'i sifirlar; ~/.local/bin'i geri ekle.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac
+export PATH
+export TMPDIR=/tmp
+# Servisler OOM'dan korunur (-900); kullanici kabuklari normal (0) -> bellek biterse once is surecleri.
+[ "$(id -u)" != 0 ] && echo 0 > /proc/$$/oom_score_adj 2>/dev/null
+alias cr='claude --continue'
+EOF
+}
+
+# kabuk-session artik runtime/rootfs katmaninda (sv_sync kopyalar).
+write_session_helper() {
+  # tmux: fare + genis gecmis; sunucu olurse de oturum bilgisi korunur.
+  [ -f "$R/etc/tmux.conf" ] || printf 'set -g history-limit 50000\nset -g mouse on\nset -g default-terminal "tmux-256color"\n' > "$R/etc/tmux.conf"
+}
+
+# --- runit servisleri ---------------------------------------------------------
+write_sv() { # ad, run-icerigi
+  d=$R/etc/kabuk/sv/$1
+  mkdir -p "$d/log" "$R/var/log/kabuk/$1"
+  printf '#!/bin/sh\nexec 2>&1\n%s\n' "$2" > "$d/run"
+  printf '#!/bin/sh\nexec svlogd -tt /var/log/kabuk/%s\n' "$1" > "$d/log/run"
+  printf 's1000000\nn5\n' > "$R/var/log/kabuk/$1/config"   # 1 MB x 5 dosya
+  chmod 755 "$d/run" "$d/log/run"
+}
+
+sv_sync() {
+  mkdir -p "$R/etc/kabuk/service" "$R/etc/kabuk/sv"
+  SHARE=$BASE/share
+  # rootfs katmani (kabuk-tsip, mosh-server sarmalayicisi, ...)
+  if [ -d "$SHARE/rootfs" ]; then
+    (cd "$SHARE/rootfs" && find . -type f) | while read -r f; do
+      mkdir -p "$R/$(dirname "$f")"; cp "$SHARE/rootfs/$f" "$R/$f"; chmod 755 "$R/$f"
+    done
+  fi
+  # servis tanimlari (run dosyalari) + svlogd
+  # (mksh: degiskenler global -> write_sv'nin 'd'si ile cakismasin diye svsrc)
+  for svsrc in "$SHARE"/sv/*/; do
+    [ -f "$svsrc/run" ] || continue
+    svname=$(basename "$svsrc")
+    write_sv "$svname" ""
+    cp "$svsrc/run" "$R/etc/kabuk/sv/$svname/run"; chmod 755 "$R/etc/kabuk/sv/$svname/run"
+  done
+  # servislerin okudugu ortam
+  ts_mode=${TS_MODE:-tun}
+  ssh_listen=$SSH_LISTEN
+  [ "$ts_mode" = userspace ] && [ -z "$ssh_listen" ] && ssh_listen=127.0.0.1
+  printf 'TS_MODE=%s\nSSH_LISTEN=%s\nTTYD_PORT=%s\n' "$ts_mode" "$ssh_listen" "${TTYD_PORT:-7681}" > "$R/etc/kabuk/env"
+  # ttyd kimlik bilgisi (bir kez uretilir, 600)
+  if [ ! -s "$R/etc/kabuk/ttyd.cred" ]; then
+    echo "dev:$(head -c 18 /dev/urandom | base64 | tr -d '/+=')" > "$R/etc/kabuk/ttyd.cred"
+  fi
+  chmod 600 "$R/etc/kabuk/ttyd.cred"
+  # sshd: yalniz anahtar, parola kapali, yalniz dev. ListenAddress run betiginde (tailnet IP).
+  mkdir -p "$R/etc/ssh/sshd_config.d"
+  cat > "$R/etc/ssh/sshd_config.d/10-kabuk.conf" <<EOF
+# kabuk tarafindan uretilir; elle duzenleme -> /data/kabuk/etc/kabuk.conf
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers $USERNAME
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+ClientAliveInterval 30
+ClientAliveCountMax 4
+X11Forwarding no
+Subsystem sftp internal-sftp
+EOF
+  grep -q '^Include /etc/ssh/sshd_config.d' "$R/etc/ssh/sshd_config" || \
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$R/etc/ssh/sshd_config"
+  # Alpine varsayilan dosdevdaki ayni anahtarlar Include'dan once gelir; ilk deger kazanir.
+  sed -i -E 's/^(Subsystem|ListenAddress|PasswordAuthentication|PermitRootLogin|AuthorizedKeysFile)/#&/' "$R/etc/ssh/sshd_config"
+  # Tam yetki (kullanici istegi): parolasiz sudo + 'android' komutu. FULL_ROOT=0 ile geri alinir.
+  if [ "${FULL_ROOT:-0}" = 1 ]; then
+    rm -f "$R/etc/sudoers.d/kabuk-full"   # eski ad: wheel kuralindan once okunuyordu (son eslesen kazanir)
+    echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" > "$R/etc/sudoers.d/zz-kabuk-full"; chmod 440 "$R/etc/sudoers.d/zz-kabuk-full"
+  else
+    rm -f "$R/etc/sudoers.d/zz-kabuk-full" "$R/etc/sudoers.d/kabuk-full"
+  fi
+  write_claude_md
+  # etkin servisler
+  for s in $(ls "$R/etc/kabuk/service" 2>/dev/null); do
+    case " $SERVICES " in *" $s "*) ;; *) rm -f "$R/etc/kabuk/service/$s";; esac
+  done
+  for s in $SERVICES; do
+    [ -d "$R/etc/kabuk/sv/$s" ] && ln -sfn "/etc/kabuk/sv/$s" "$R/etc/kabuk/service/$s"
+  done
+  return 0
+}
+
+# Claude Code'a ortami anlat (~/.claude/CLAUDE.md icinde isaretli blok; kullanicinin kendi
+# yazdiklari korunur).
+write_claude_md() {
+  f=$R/home/$USERNAME/.claude/CLAUDE.md
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  sed -i '/<!-- kabuk:baslangic -->/,/<!-- kabuk:son -->/d' "$f"
+  if [ "${FULL_ROOT:-0}" = 1 ]; then yetki="- \`sudo\` PAROLASIZ calisir (chroot icinde root).
+- \`android <komut>\` Android tarafinda ROOT olarak calistirir (Magisk): \`android getprop ro.product.model\`,
+  \`android pm list packages\`, \`android settings get global ...\`, \`android dumpsys battery\`,
+  \`android cat /proc/cmdline\`. Argumansiz \`android\` etkilesimli Android kabugu acar.
+- Bu tam yetkidir: telefonu bozabilecek islemlerde (uygulama silme, /system, bootloader, Magisk,
+  ag/Tailscale ayarlari, /data/kabuk) once kullaniciya sor."
+  else yetki="- \`sudo\` kapali; Android tarafina erisim yok (FULL_ROOT=0)."; fi
+  cat >> "$f" <<EOF
+<!-- kabuk:baslangic -->
+## Ortam (Kabuk Sunucu tarafindan yazildi)
+- Bu makine: rootlu Xiaomi Redmi Note 10 5G (camellia, Android 12, MIUI 13, Magisk). Hostname note10.
+- Sen Android uzerinde gercek bir **chroot** icindeki **Alpine Linux 3.24 (aarch64, musl)** ortamindasin;
+  kullanici \`dev\`. Paket kurmak: \`sudo apk add <paket>\`. Projeler: ~/projeler.
+$yetki
+- Uzaktan erisim yalniz Tailscale (tailnet) uzerinden; LAN'a port acma. Gelistirme sunuculari
+  0.0.0.0'a baglanabilir (LAN guvenlik duvari keser, tailnet'ten erisilir: http://note10:<port>).
+- Servisleri yonetme (Android tarafi): \`android /data/kabuk/bin/kabuk status|restart\`.
+<!-- kabuk:son -->
+EOF
+  chown -R $USER_UID:$USER_UID "$R/home/$USERNAME/.claude"; chmod 600 "$f"
+}
+
+runsvdir_pid() {
+  for p in $(pidof runsvdir 2>/dev/null); do
+    [ "$(readlink /proc/$p/root)" = "$R" ] && { echo "$p"; return; }
+  done
+}
+
+# Rootfs icindeki, adi verilen surecler
+procs_named() {
+  users_of_rootfs | while read -r p; do
+    c=$(cat /proc/$p/comm 2>/dev/null)
+    for n in "$@"; do [ "$c" = "$n" ] && { echo "$p"; break; }; done
+  done
+}
+
+# runsvdir oldugunde sahipsiz kalan denetim agaci (runsv/svlogd/servis daemon'lari) port ve
+# supervise kilitlerini tutar; yeni runsvdir ile cakisir. Temizle. Kullanici oturumlari
+# (tmux, sshd-session, claude) korunur.
+SV_DAEMONS="runsv svlogd sshd tailscaled ntfy ttyd"
+kill_orphans() {
+  o=$(procs_named $SV_DAEMONS | tr '\n' ' ')
+  [ -n "$o" ] || return 0
+  log "sahipsiz denetim surecleri temizleniyor: $o"
+  kill $o 2>/dev/null; sleep 2
+  o=$(procs_named $SV_DAEMONS | tr '\n' ' '); [ -n "$o" ] && kill -9 $o 2>/dev/null
+  return 0
+}
+
+setup_cpuset() {
+  [ -d /dev/cpuset ] || return 0
+  if [ ! -d $CPUSET ]; then
+    mkdir $CPUSET && cat /dev/cpuset/mems > $CPUSET/mems && cat /dev/cpuset/cpus > $CPUSET/cpus
+  fi
+  echo $$ > $CPUSET/tasks 2>/dev/null
+}
+
+do_start() {
+  [ -f "$BASE/DISABLED" ] && die "acil durdurma aktif ($BASE/DISABLED). 'kabuk enable' ile kaldir."
+  fw_on   # servislerden ONCE: LAN'a hicbir an acik kalmasin
+  ts_route_sync
+  do_mount
+  sv_sync
+  if [ -z "$(runsvdir_pid)" ]; then
+    kill_orphans
+    setup_cpuset
+    echo -900 > /proc/self/oom_score_adj
+    # setsid: oturumdan bagimsiz; cikti runit log'larina gider.
+    # (setsid shell fonksiyonu calistiramaz -> dogrudan chroot)
+    setsid unshare -u /system/bin/sh -c 'hostname "$0"; exec "$@"' "${TS_HOSTNAME:-note10}" \
+      chroot "$R" /usr/bin/env -i HOME=/root LANG=C.UTF-8 TZ="$(getprop persist.sys.timezone)" \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      runsvdir -P /etc/kabuk/service </dev/null >/dev/null 2>&1 &
+    sleep 2
+    p=$(runsvdir_pid); [ -n "$p" ] || die "runsvdir baslamadi"
+    log "runsvdir basladi pid=$p"
+  fi
+  # Kalici tmux oturumu (yeniden baslatmadan sonra da hazir).
+  as_user "tmux has-session -t $SESSION 2>/dev/null || tmux new-session -d -s $SESSION -c \$HOME" >/dev/null 2>&1
+  return 0
+}
+
+do_stop() {
+  p=$(runsvdir_pid)
+  if [ -n "$p" ]; then
+    chroot_env root /bin/sh -c 'sv -w 10 force-stop /etc/kabuk/service/* 2>/dev/null; true'
+    kill -HUP "$p" 2>/dev/null
+    sleep 1
+    log "servisler durdu"
+  fi
+  [ "${1:-}" = all ] && { as_user 'tmux kill-server' 2>/dev/null; do_umount force; }
+  return 0
+}
+
+do_sv() {
+  [ -n "$(runsvdir_pid)" ] || die "servisler calismiyor (kabuk start)"
+  c=${1:-status}; shift 2>/dev/null
+  if [ $# -eq 0 ]; then chroot_env root /bin/sh -c "sv $c /etc/kabuk/service/*"
+  else chroot_env root /bin/sh -c "sv $c /etc/kabuk/service/$1"; fi
+}
+
+do_status() {
+  echo "rootfs:    $R ($( [ -x "$R/bin/busybox" ] && cat "$R/etc/alpine-release" || echo yok))"
+  echo "mounts:    $(grep -c " $R/" /proc/mounts)"
+  echo "surecler:  $(users_of_rootfs | wc -l)"
+  echo "runsvdir:  $(runsvdir_pid || true)"
+  [ -n "$(runsvdir_pid)" ] && chroot_env root /bin/sh -c 'sv status /etc/kabuk/service/* 2>/dev/null' | sed 's/^/servis:    /'
+  echo "durdurma:  $( [ -f "$BASE/DISABLED" ] && echo AKTIF || echo yok)"
+  echo "pil:       $(cat $BAT/capacity)% $(( $(cat $BAT/temp) / 10 )).$(( $(cat $BAT/temp) % 10 ))C $(cat $BAT/status) input_suspend=$(cat $BAT/input_suspend)"
+  echo "wakelock:  $(grep -qw kabuk /sys/power/wake_lock && echo tutuluyor || echo yok)"
+  echo "boyut:     $(du -sh "$R" 2>/dev/null | cut -f1)"
+  ls -1 "$BACKUPS" 2>/dev/null | sed 's/^/yedek:     /'
+}
+
+# --- Android ayarlari (her boot'ta) ----------------------------------------------
+do_tweaks() {
+  # Phantom process killer (Android 12): kapat. (Servisler uygulama alt sureci degil ama yine de.)
+  device_config set_sync_disabled_for_tests persistent
+  device_config put activity_manager max_phantom_processes 2147483647
+  settings put global settings_enable_monitor_phantom_procs false
+  # Doze / MIUI arka plan: uygulamayi muaf tut (asil servisler Magisk altinda, Doze'dan etkilenmez).
+  dumpsys deviceidle whitelist +com.kabuk.server >/dev/null 2>&1
+  cmd appops set com.kabuk.server RUN_ANY_IN_BACKGROUND allow 2>/dev/null
+  cmd appops set com.kabuk.server RUN_IN_BACKGROUND allow 2>/dev/null
+  cmd appops set com.kabuk.server 10008 allow 2>/dev/null   # MIUI otomatik baslatma
+  # Wi-Fi uykuda kapanmasin.
+  settings put global wifi_sleep_policy 2
+  log "tweaks: phantom=$(device_config get activity_manager max_phantom_processes) wifi_sleep=$(settings get global wifi_sleep_policy)"
+}
+
+# --- guvenlik duvari: LAN'dan gelen yeni baglantilari kes ----------------------
+# Yalniz wlan+/eth+ (LAN). Mobil veri (rmnet) haric: IMS/VoLTE bozulmasin; operator CGNAT'i
+# zaten gelen baglantilari kesiyor. tailscale0 ve lo etkilenmez.
+fw_chain() { # iptables | ip6tables
+  t="$1 -w"
+  $t -N KABUK_IN 2>/dev/null; $t -F KABUK_IN
+  $t -A KABUK_IN -m state --state ESTABLISHED,RELATED -j RETURN
+  if [ "$1" = iptables ]; then
+    $t -A KABUK_IN -p icmp -j RETURN
+    $t -A KABUK_IN -p udp --sport 67 --dport 68 -j RETURN          # DHCP istemci
+  else
+    $t -A KABUK_IN -p ipv6-icmp -j RETURN                           # NDP/RA
+    $t -A KABUK_IN -p udp --sport 547 --dport 546 -j RETURN         # DHCPv6 istemci
+  fi
+  $t -A KABUK_IN -p udp --dport 41641 -j RETURN                     # Tailscale dogrudan baglanti
+  $t -A KABUK_IN -p udp --dport 5353 -j RETURN                      # mDNS
+  for p in ${FW_ALLOW_TCP:-}; do $t -A KABUK_IN -p tcp --dport "$p" -j RETURN; done   # LAN'a acik ek TCP (kabuk.conf: kablosuz adb 5555)
+  $t -A KABUK_IN -p tcp -j DROP
+  $t -A KABUK_IN -p udp -j DROP
+  for i in wlan+ eth+; do
+    $t -C INPUT -i $i -j KABUK_IN 2>/dev/null || $t -I INPUT 1 -i $i -j KABUK_IN
+  done
+}
+fw_on() {
+  [ "${FIREWALL:-1}" = 1 ] || { fw_off; return 0; }
+  fw_chain iptables; fw_chain ip6tables
+}
+fw_off() {
+  for t in iptables ip6tables; do
+    for i in wlan+ eth+; do while $t -w -D INPUT -i $i -j KABUK_IN 2>/dev/null; do :; done; done
+    $t -w -F KABUK_IN 2>/dev/null; $t -w -X KABUK_IN 2>/dev/null
+  done
+  return 0
+}
+fw_ok() { iptables -w -C INPUT -i wlan+ -j KABUK_IN 2>/dev/null && ip6tables -w -C INPUT -i wlan+ -j KABUK_IN 2>/dev/null; }
+
+# --- tailscale ------------------------------------------------------------------
+# tailscaled kendi soketlerini fwmark 0x80000 ile isaretler ve 5210 'main' / 5230 'default'
+# tablolarina bakar, bulamazsa 5250'de 'unreachable'. Android'de varsayilan rota 'main'de degil,
+# ag basina tablodadir (wlan0, rmnet_dataN). 5240'ta isaretli trafigi Android'in o anki
+# varsayilan ag tablosuna yonlendir; ag degisince (Wi-Fi <-> mobil) watchdog gunceller.
+ts_route_sync() {
+  for v in 4 6; do
+    def=$(ip -$v rule 2>/dev/null | awk '/^29000:/ && /iif lo lookup/ {print $NF; exit}')
+    cur=$(ip -$v rule 2>/dev/null | awk '/^5240:/ {print $NF; exit}')
+    [ -n "$def" ] || continue
+    if [ "$def" != "$cur" ]; then
+      while ip -$v rule del pref 5240 2>/dev/null; do :; done
+      ip -$v rule add pref 5240 fwmark 0x80000/0xff0000 lookup "$def"
+      log "tailscale yonlendirme (IPv$v): varsayilan ag tablosu -> $def"
+    fi
+  done
+  return 0
+}
+
+ts() { chroot_env root tailscale --socket=/run/tailscale/tailscaled.sock "$@"; }
+do_ts_up() {
+  [ -n "$(procs_named tailscaled)" ] || die "tailscaled calismiyor"
+  args="--hostname=${TS_HOSTNAME:-note10} --accept-dns=false --netfilter-mode=off --accept-routes=false"
+  if ts status >/dev/null 2>&1; then ts up $args; ts status | head -5; return; fi
+  out=$RUN/ts-up.log; rm -f "$out"
+  ( ts up $args --timeout=600s >"$out" 2>&1 & )
+  i=0; while [ $i -lt 30 ]; do grep -q 'https://login.tailscale.com' "$out" 2>/dev/null && break; sleep 1; i=$((i+1)); done
+  url=$(grep -o 'https://login.tailscale.com[^ ]*' "$out" | head -1)
+  [ -n "$url" ] && { echo "GIRIS: $url"; notify "Tailscale girisi: $url"; } || cat "$out"
+}
+
+# --- watchdog -----------------------------------------------------------------
+notify() {
+  msg="$*"
+  log "BILDIRIM: $msg"
+  cmd notification post -S bigtext -t "Kabuk Sunucu" kabuk "$msg" >/dev/null 2>&1
+  # Istemciye: tailnet icindeki ntfy (kabuk-notify adresi kendisi bulur)
+  if [ -x "$R/usr/local/bin/kabuk-notify" ] && is_mnt "$R/proc"; then
+    printf '{"message":%s}' "$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" |
+      chroot_env root /usr/local/bin/kabuk-notify test >/dev/null 2>&1
+  fi
+}
+
+wl() { # wakelock: on|off
+  if [ "$1" = on ]; then grep -qw kabuk /sys/power/wake_lock || echo kabuk > /sys/power/wake_lock
+  else grep -qw kabuk /sys/power/wake_lock && echo kabuk > /sys/power/wake_unlock; fi
+  return 0
+}
+
+# Is var mi? dev'in (uid 8000) bosta bekleyen kabuk/tmux/mosh disinda sureci.
+has_work() {
+  # ajan sunucusu (node /opt/kabuk-agent) surekli acik: is sayilmaz; baslattigi 'claude' sayilir.
+  ps -A -o UID,NAME,ARGS 2>/dev/null | awk -v u=$USER_UID '
+    $1==u && $2!~/^(tmux|bash|-bash|sh|mosh-server|login|su)/ && $0!~/\/opt\/kabuk-agent\// {f=1} END{exit !f}'
+}
+
+CHG_NOTE=""
+charge_tick() {
+  [ "$CHARGE_LIMIT" = 1 ] && [ -w $BAT/input_suspend ] || return 0
+  cap=$(cat $BAT/capacity); susp=$(cat $BAT/input_suspend); t=$(cat $BAT/temp)
+  want=$susp
+  if [ "$cap" -le "$CHARGE_FAILSAFE" ]; then want=0
+  elif [ "$cap" -ge "$CHARGE_STOP" ]; then want=1
+  elif [ "$cap" -le "$CHARGE_START" ]; then want=0
+  fi
+  [ "$t" -ge $((HOT_STOP_CHARGE_C*10)) ] && want=1
+  if [ "$want" != "$susp" ]; then
+    echo "$want" > $BAT/input_suspend
+    log "sarj: input_suspend $susp -> $want (pil %$cap, ${t}d-C)"
+  fi
+  # Sarj penceresinde uyanik kal: uyurken %80'i asmasin.
+  [ "$want" = 0 ] && [ "$cap" -ge $((CHARGE_STOP-3)) ] && CHG_NOTE=hold || CHG_NOTE=""
+}
+
+HOT=0
+thermal_tick() {
+  t=$(cat $BAT/temp)
+  if [ $HOT = 0 ] && [ "$t" -ge $((HOT_C*10)) ]; then
+    HOT=1
+    [ -d $CPUSET ] && echo 0-3 > $CPUSET/cpus
+    for p in $(ps -A -o UID,PID | awk -v u=$USER_UID '$1==u{print $2}'); do renice -n 10 -p "$p" >/dev/null 2>&1; done
+    notify "Pil $((t/10)).$((t%10))C >= ${HOT_C}C: agir isler kucuk cekirdeklere alindi ve yavaslatildi."
+  elif [ $HOT = 1 ] && [ "$t" -le $(((HOT_C-3)*10)) ]; then
+    HOT=0
+    [ -d $CPUSET ] && cat /dev/cpuset/cpus > $CPUSET/cpus
+    notify "Pil sogudu ($((t/10)).$((t%10))C): tam hiz."
+  fi
+}
+
+wakelock_tick() {
+  case "$WAKELOCK" in
+    always) wl on ;;
+    off) [ -n "$CHG_NOTE" ] && wl on || wl off ;;
+    *) if has_work || [ -n "$CHG_NOTE" ]; then wl on; else wl off; fi ;;
+  esac
+}
+
+NET_DOWN_SINCE=0; NET_LAST_RESET=0
+net_tick() {
+  now=$(date +%s)
+  if ip route get 1.1.1.1 >/dev/null 2>&1 && ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+    [ $NET_DOWN_SINCE != 0 ] && log "ag geri geldi ($((now-NET_DOWN_SINCE)) s kesinti)"
+    NET_DOWN_SINCE=0; return 0
+  fi
+  [ $NET_DOWN_SINCE = 0 ] && { NET_DOWN_SINCE=$now; log "ag yok"; }
+  if [ $((now-NET_DOWN_SINCE)) -ge $NET_RESET_AFTER ] && [ $((now-NET_LAST_RESET)) -ge 900 ] \
+     && [ "$(settings get global wifi_on)" != 0 ]; then
+    NET_LAST_RESET=$now
+    log "ag ${NET_RESET_AFTER}s+ yok: Wi-Fi yeniden baslatiliyor"
+    cmd wifi set-wifi-enabled disabled; sleep 3; cmd wifi set-wifi-enabled enabled
+  fi
+}
+
+rotate() { # dosya, bayt
+  [ -f "$1" ] && [ "$(stat -c %s "$1")" -gt "$2" ] && { mv -f "$1.2" "$1.3" 2>/dev/null; mv -f "$1.1" "$1.2" 2>/dev/null; mv -f "$1" "$1.1"; }
+  return 0
+}
+
+do_health() { # tek satir CSV
+  f=$LOGDIR/health.csv
+  [ -f "$f" ] || echo "zaman,pil,pil_c,cpu_c,durum,input_suspend,wakelock,runsvdir,servisler_up,load1,mem_avail_mb,ag" > "$f"
+  cpu=$(for z in /sys/class/thermal/thermal_zone*; do [ "$(cat $z/type)" = mtktscpu ] && cat $z/temp; done)
+  up=0; [ -n "$(runsvdir_pid)" ] && up=$(chroot_env root /bin/sh -c 'sv status /etc/kabuk/service/* 2>/dev/null' | grep -c '^run:')
+  ag=0; ip route get 1.1.1.1 >/dev/null 2>&1 && ag=1
+  echo "$(date '+%F %T'),$(cat $BAT/capacity),$(( $(cat $BAT/temp)/10 )),$(( ${cpu:-0}/1000 )),$(cat $BAT/status),$(cat $BAT/input_suspend),$(grep -qw kabuk /sys/power/wake_lock && echo 1 || echo 0),$( [ -n "$(runsvdir_pid)" ] && echo 1 || echo 0),$up,$(cut -d' ' -f1 /proc/loadavg),$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo)/1024 )),$ag" >> "$f"
+}
+
+do_watchdog() {
+  # Tek kopya (mksh exec'li fd'ler close-on-exec -> alt kabuk yonlendirmesi)
+  # Bloklayan kilit: baska kopya varsa yedek olarak bekler, o olurse devralir.
+  ( flock 7; watchdog_loop ) 7>"$RUN/watchdog.lock"
+}
+
+watchdog_loop() {
+  echo $$ > "$RUN/watchdog.pid"
+  trap 'echo 0 > $BAT/input_suspend; wl off; log "watchdog sonlandi"; exit 0' TERM INT
+  log "watchdog basladi"
+  last_health=0
+  while [ ! -f "$BASE/DISABLED" ]; do
+    [ -f "$CONF" ] && . "$CONF"
+    if [ -z "$(runsvdir_pid)" ]; then log "runsvdir yok -> baslatiliyor"; do_start; fi
+    if [ "${FIREWALL:-1}" = 1 ] && ! fw_ok; then log "guvenlik duvari eksik -> yeniden kuruluyor"; fw_on; fi
+    ts_route_sync
+    charge_tick; thermal_tick; wakelock_tick; net_tick
+    now=$(date +%s)
+    if [ $((now-last_health)) -ge 300 ]; then do_health; last_health=$now; fi
+    rotate "$LOGDIR/boot.log" 1000000; rotate "$LOGDIR/health.csv" 2000000
+    sleep 30
+  done
+  echo 0 > $BAT/input_suspend; wl off
+  log "acil durdurma: watchdog cikiyor"
+}
+
+# --- panel: uygulama icin tek cagrida durum (anahtar=deger) ----------------------
+do_panel() {
+  echo "disabled=$( [ -f "$BASE/DISABLED" ] && echo 1 || echo 0)"
+  echo "rootfs=$( [ -x "$R/bin/busybox" ] && cat "$R/etc/alpine-release" || echo yok)"
+  if [ -n "$(runsvdir_pid)" ]; then
+    chroot_env root /bin/sh -c 'for s in /etc/kabuk/service/*; do n=${s##*/}; st=$(sv status $s 2>/dev/null | cut -d: -f1); up=$(sv status $s 2>/dev/null | sed -nE "s/^run: [^(]*\(pid [0-9]+\) ([0-9]+)s.*/\1/p"); echo "svc.$n=$st ${up:-0}"; done'
+  else for s in $SERVICES; do echo "svc.$s=down 0"; done; fi
+  if [ -n "$(procs_named tailscaled)" ]; then
+    j=$(ts status --json 2>/dev/null)
+    echo "ts.state=$(echo "$j" | chroot_env root jq -r '.BackendState // "?"')"
+    echo "ts.name=$(echo "$j" | chroot_env root jq -r '.Self.DNSName // "" | rtrimstr(".")')"
+    echo "ts.ip=$(echo "$j" | chroot_env root jq -r '(.Self.TailscaleIPs // [])[0] // ""')"
+    echo "ts.auth=$(echo "$j" | chroot_env root jq -r '.AuthURL // ""')"
+    echo "ts.peers=$(echo "$j" | chroot_env root jq -r '[.Peer[]? | select(.Online)] | length')"
+  else echo "ts.state=calismiyor"; fi
+  echo "sess.ssh=$(procs_named sshd-session | wc -l)"
+  echo "sess.mosh=$(procs_named mosh-server | wc -l)"
+  echo "sess.tmux=$(as_user 'tmux ls -F "#{session_name}(#{session_attached})" 2>/dev/null' | tr '\n' ' ')"
+  echo "work=$(has_work && echo 1 || echo 0)"
+  cpu=$(for z in /sys/class/thermal/thermal_zone*; do [ "$(cat $z/type)" = mtktscpu ] && cat $z/temp; done)
+  echo "cpu.temp=$(( ${cpu:-0} / 1000 ))"
+  echo "cpu.load=$(cut -d' ' -f1-3 /proc/loadavg)"
+  echo "cpu.cpus=$(cat $CPUSET/cpus 2>/dev/null)"
+  echo "bat.level=$(cat $BAT/capacity)"
+  t=$(cat $BAT/temp); echo "bat.temp=$((t/10)).$((t%10))"
+  echo "bat.status=$(cat $BAT/status)"
+  echo "bat.suspend=$(cat $BAT/input_suspend)"
+  echo "bat.limit=$CHARGE_LIMIT $CHARGE_START $CHARGE_STOP"
+  echo "bat.hot=$HOT_C"
+  echo "mem=$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%d %d", a/1024, t/1024}' /proc/meminfo)"
+  echo "disk=$(df -k /data | awk 'NR==2{printf "%d %d", $4/1048576, $2/1048576}')"
+  echo "wakelock=$(grep -qw kabuk /sys/power/wake_lock && echo 1 || echo 0)"
+  echo "fw=$(fw_ok && echo 1 || echo 0)"
+  echo "net.lan=$(ip -4 addr show wlan0 2>/dev/null | awk '/inet /{print $2; exit}')"
+  echo "net.ssid=$(dumpsys wifi 2>/dev/null | grep -m1 -oE 'SSID: \"[^\"]*\"' | sed 's/SSID: \"//; s/\"$//')"
+  echo "net.link=$(cat /sys/class/net/wlan0/speed 2>/dev/null)"
+  echo "backups=$(ls -1 "$BACKUPS" 2>/dev/null | tr '\n' ' ')"
+  echo "uptime=$(cut -d. -f1 /proc/uptime)"
+}
+
+# --- dagitim: APK/adb'den gelen runtime agacini yerine koy ----------------------
+do_deploy() {
+  src=${1:-}; [ -d "$src/bin" ] || die "kaynak yok: $src"
+  mkdir -p "$BASE/bin"
+  cp "$src"/bin/* "$BASE/bin/" && chmod 755 "$BASE"/bin/*
+  if [ -d "$src/magisk" ]; then
+    mkdir -p "$MODDIR"
+    cp "$src"/magisk/* "$MODDIR/" && chmod 755 "$MODDIR"/*.sh
+    rm -f "$MODDIR/remove" "$MODDIR/disable"
+  fi
+  rm -rf "$BASE/share"; mkdir -p "$BASE/share"
+  for d in sv rootfs tests; do [ -d "$src/$d" ] && cp -r "$src/$d" "$BASE/share/"; done
+  [ -f "$CONF" ] || { [ -f "$src/etc/kabuk.conf" ] && cp "$src/etc/kabuk.conf" "$CONF"; }
+  chmod 600 "$CONF" 2>/dev/null
+  log "deploy tamam: $(ls "$BASE/bin" | tr '\n' ' ') modul=$( [ -f $MODDIR/module.prop ] && echo var || echo yok)"
+}
+
+# --- yedek / geri yukleme --------------------------------------------------
+do_backup() {
+  [ -x "$R/bin/busybox" ] || die "rootfs yok"
+  out=$BACKUPS/rootfs-$(date +%Y%m%d-%H%M%S).tar.gz
+  snap=$BASE/.snap; mkdir -p "$snap"
+  # Duz (recursive olmayan) bind: proc/sys/dev/tmp alt mount'lari yedege girmez.
+  mount --bind "$R" "$snap" || die "bind hatasi"
+  log "yedekleniyor -> $out"
+  nice -n 15 tar -czf "$out.part" -C "$snap" . ; rc=$?
+  umount "$snap"; rmdir "$snap"
+  [ $rc = 0 ] || { rm -f "$out.part"; die "tar hatasi ($rc)"; }
+  mv "$out.part" "$out"; chmod 600 "$out"
+  # en fazla 3 yedek tut
+  ls -1t "$BACKUPS"/rootfs-*.tar.gz | tail -n +4 | xargs rm -f 2>/dev/null
+  log "tamam: $(du -h "$out" | cut -f1)"
+}
+
+do_restore() {
+  f=${1:-}; [ -f "$f" ] || die "yedek dosyasi yok: $f"
+  do_stop all
+  [ -z "$(users_of_rootfs)" ] || die "rootfs kullanimda"
+  do_umount force
+  old=$R.old-$(date +%Y%m%d-%H%M%S)
+  [ -d "$R" ] && mv "$R" "$old"
+  mkdir -p "$R" && tar -xzf "$f" -C "$R" || { rm -rf "$R"; [ -d "$old" ] && mv "$old" "$R"; die "geri yukleme basarisiz, eskisi geri alindi"; }
+  log "geri yuklendi. eski rootfs: $old (kontrol edip silebilirsin)"
+}
+
+# --- regresyon testleri -----------------------------------------------------
+do_test() {
+  pass=0; fail=0
+  t() { name=$1; shift
+    if out=$("$@" 2>&1); then pass=$((pass+1)); echo "OK   $name"
+    else fail=$((fail+1)); echo "FAIL $name"; echo "$out" | tail -5 | sed 's/^/     /'; fi; }
+  U() { as_user "$1"; }
+  do_mount
+  t "tmp gercek tmpfs"      U 'grep -q " /tmp tmpfs " /proc/mounts && echo x > /tmp/kb.$$ && rm /tmp/kb.$$'
+  t "rm -rf .git"           U 'd=$(mktemp -d) && cd $d && git init -q && echo a>a && git add a && git -c user.email=t@t -c user.name=t commit -qm a && rm -rf .git && [ ! -e .git ] && cd / && rm -rf $d'
+  t "kullanici dev"       U '[ "$(id -u)" = 8000 ] && [ "$(stat -c %a $HOME)" = 700 ]'
+  t "ag (DNS+HTTPS)"        U 'curl -fsS -o /dev/null -m 15 https://dl-cdn.alpinelinux.org/'
+  t "claude --version"      U 'claude --version'
+  t "git/rg/node/py/jq"     U 'git --version && rg --version && node -v && python3 -V && jq --version && command -v mosh-server && tmux -V'
+  t "pty + tmux"            U 'tmux -L kbtest new -d -s t "sleep 30" && tmux -L kbtest has -t t && tmux -L kbtest kill-server'
+  t "dev/null, urandom"     U 'echo x > /dev/null && head -c 8 /dev/urandom | wc -c | grep -q 8'
+  t "/dev/net/tun"          test -c "$R/dev/net/tun"
+  if [ "${FULL_ROOT:-0}" = 1 ]; then
+    t "tam yetki: sudo"      U 'sudo -n true && [ "$(sudo -n id -u)" = 0 ]'
+    t "tam yetki: android"   U '[ -n "$(android getprop ro.product.device)" ]'
+  else
+    t "sudo parolasiz kapali" U '! sudo -n true'
+  fi
+  t "kullanici oom_adj 0"   U '[ "$(cat /proc/self/oom_score_adj)" = 0 ]'
+  t "kimlik izinleri 600/700" U 'for f in ~/.claude/settings.json ~/.claude/.credentials.json ~/.ssh/authorized_keys; do [ -e "$f" ] || continue; [ "$(stat -c %a "$f")" = 600 ] || { echo "$f $(stat -c %a "$f")"; exit 1; }; done; for d in ~/.claude ~/.ssh; do [ -e "$d" ] || continue; [ "$(stat -c %a "$d")" = 700 ] || { echo "$d"; exit 1; }; done'
+  t "LAN guvenlik duvari"   fw_ok
+  # chroot servisleri yalniz lo/tailnet'te dinlemeli (Android'in kendi dinleyicileri duvarla kapali)
+  chroot_listen() {
+    for p in $(procs_named sshd ttyd ntfy mosh-server); do
+      ss -lntupH 2>/dev/null | grep "pid=$p," | awk '{print $5}'
+    done | grep -vE '^(127\.|100\.|\[fd7a:|\[::1\])' | grep . && return 1
+    return 0
+  }
+  t "servisler LAN'da dinlemiyor" chroot_listen
+  if [ -n "$(runsvdir_pid)" ]; then
+    t "sshd calisiyor"      chroot_env root /bin/sh -c 'sv status /etc/kabuk/service/sshd | grep -q ^run:'
+    t "sshd parola kapali"  chroot_env root /bin/sh -c '/usr/sbin/sshd -T | grep -qx "passwordauthentication no" && /usr/sbin/sshd -T | grep -qx "permitrootlogin no"'
+    t "tmux oturumu: $SESSION" U "tmux has-session -t $SESSION"
+  elif [ -z "$(as_user "tmux ls 2>/dev/null")" ]; then
+    # Sizinti testleri yalniz servis/oturum yokken anlamli.
+    do_umount
+    t "mount sizintisi yok"   sh -c "! grep -q ' $R/' /proc/mounts"
+    keep_test() {
+      do_mount; chroot "$R" /bin/sleep 20 & sp=$!; sleep 1
+      do_umount; n=$(grep -c " $R/" /proc/mounts)
+      kill $sp; wait $sp 2>/dev/null; do_umount
+      [ "$n" -gt 0 ] && ! grep -q " $R/" /proc/mounts
+    }
+    t "surec varken mount korunur" keep_test
+  fi
+  echo "sonuc: $pass gecti, $fail kaldi"
+  [ $fail = 0 ]
+}
+
+cmd=${1:-enter}; [ $# -gt 0 ] && shift
+case "$cmd" in
+  enter)    do_enter "$@" ;;
+  run)      [ $# -ge 2 ] || die "kullanim: kabuk run <kullanici> <komut>"; do_run "$@" ;;
+  mount)    do_mount ;;
+  umount)   do_umount "${1:-}" ;;
+  status)   do_status ;;
+  install)  do_install ;;
+  backup)   do_backup ;;
+  restore)  do_restore "$@" ;;
+  test)     do_test ;;
+  deploy)   do_deploy "$@" ;;
+  tweaks)   do_tweaks ;;
+  start)    do_start ;;
+  stop)     do_stop "${1:-}" ;;
+  restart)  do_stop; do_start ;;
+  sv)       do_sv "$@" ;;
+  watchdog) do_watchdog ;;
+  health)   do_health; tail -1 "$LOGDIR/health.csv" ;;
+  notify)   notify "$*" ;;
+  disable)  # ACIL DURDURMA: tum uzaktan erisimi kes (tmux'taki isler yerelde surer)
+            touch "$BASE/DISABLED"
+            [ -n "$(procs_named tailscaled)" ] && ts down 2>/dev/null
+            do_stop
+            o=$(procs_named sshd-session mosh-server ttyd | tr '\n' ' '); [ -n "$o" ] && kill $o 2>/dev/null
+            echo 0 > $BAT/input_suspend; wl off
+            notify "ACIL DURDURMA: uzaktan erisim kapatildi"; log "ACIL DURDURMA: servisler kapali" ;;
+  fw)       case "${1:-status}" in on) fw_on;; off) fw_off;; *) iptables -w -S KABUK_IN; iptables -w -S INPUT | grep KABUK;; esac ;;
+  authkey)  # dev'e yetkili SSH anahtari ekle (yalniz ssh-ed25519 / ecdsa / sk-*)
+            k="$*"
+            case "$k" in ssh-ed25519\ *|ecdsa-sha2-nistp256\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *) ;;
+              *) die "gecersiz anahtar (ssh-ed25519/ecdsa-sha2-nistp256 bekleniyor)";; esac
+            a=$R/home/$USERNAME/.ssh; mkdir -p "$a"; touch "$a/authorized_keys"
+            if grep -qF "$(echo "$k" | awk '{print $2}')" "$a/authorized_keys"; then log "anahtar zaten var"
+            else echo "$k" >> "$a/authorized_keys"; log "anahtar eklendi: $(echo "$k" | awk '{print $1" ..."substr($2,length($2)-11)" "$3}')"; fi
+            chown -R $USER_UID:$USER_UID "$a"; chmod 700 "$a"; chmod 600 "$a/authorized_keys" ;;
+  panel)    do_panel ;;
+  ts)       ts "$@" ;;
+  ts-up)    do_ts_up ;;
+  enable)   rm -f "$BASE/DISABLED"; do_start
+            setsid /system/bin/sh "$BASE/bin/kabuk-boot" </dev/null >/dev/null 2>&1 &
+            log "servisler ve watchdog yeniden basladi" ;;
+  *) die "bilinmeyen komut: $cmd" ;;
+esac

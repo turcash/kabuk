@@ -1,0 +1,89 @@
+#!/system/bin/sh
+# Sunucu modu: Redmi'yi yalniz sunucu olarak calisan cihaza cevir (geri alinabilir).
+#   kabuk-servermode on      -> gereksiz uygulamalari 'pm disable-user' ile kapat + ayarlar
+#   kabuk-servermode extra <paket...>  -> listeye ek paket kapat (kisisel uygulamalar, onayla)
+#   kabuk-servermode off     -> her seyi eski haline getir
+#   kabuk-servermode status
+# Uygulamalar SILINMEZ (verisi kalir); 'pm enable' ile geri gelir.
+BASE=/data/kabuk/etc
+LIST=$BASE/servermode.disabled
+SETS=$BASE/servermode.settings
+mkdir -p $BASE
+
+# Kademe A: sunucuya katkisi olmayan, kisisel veri tutmayan uygulamalar.
+# DOKUNULMAYANLAR: telefon/SMS/telecom, ayarlar, klavye, launcher, Magisk, GMS/GSF, WebView,
+# networkstack, paket yukleyici, izinler, MIUI powerkeeper/securitycenter, Cihazimi Bul + cloudservice.
+TIER_A="
+com.miui.analytics com.miui.msa.global com.xiaomi.joyose com.miui.daemon com.miui.hybrid com.miui.hybrid.accessory
+com.miui.yellowpage com.miui.weather2 com.miui.player com.miui.videoplayer com.miui.fm com.miui.fmservice
+com.miui.compass com.miui.mediaeditor com.miui.android.fashiongallery com.xiaomi.discover com.xiaomi.midrop
+com.xiaomi.payment org.mipay.android.manager com.xiaomi.scanner com.miui.bugreport com.miui.miservice
+com.mi.healthglobal com.miui.touchassistant com.miui.screenrecorder com.mediatek.mt6833.gamedriver
+com.miui.cloudbackup com.tencent.igxiaomi cn.wps.xiaomi.abroad.lite com.duokan.phone.remotecontroller com.mi.AutoTest
+com.facebook.appmanager com.facebook.services com.facebook.system com.facebook.katana
+com.google.android.youtube com.google.android.apps.youtube.music com.google.android.videos
+com.google.android.apps.magazines com.google.android.apps.podcasts com.google.android.apps.tachyon
+com.google.android.apps.bard com.google.android.apps.googleassistant com.google.android.googlequicksearchbox
+com.android.hotwordenrollment.okgoogle com.android.hotwordenrollment.xgoogle com.google.android.apps.maps
+com.google.android.projection.gearhead com.google.android.apps.subscriptions.red com.google.ar.core
+com.google.android.apps.wellbeing com.google.android.feedback
+com.amazon.appmanager
+"
+
+is_enabled() { pm list packages -e "$1" 2>/dev/null | grep -qx "package:$1"; }
+
+disable_pkgs() {
+  for p in "$@"; do
+    is_enabled "$p" || continue
+    am force-stop "$p" 2>/dev/null
+    if pm disable-user --user 0 "$p" >/dev/null 2>&1; then
+      grep -qx "$p" $LIST 2>/dev/null || echo "$p" >> $LIST
+      echo "kapatildi: $p"
+    else echo "ATLANDI (kapatilamadi): $p"; fi
+  done
+}
+
+set_kv() { # ns anahtar deger  (ilk degisimde eski degeri kaydet)
+  old=$(settings get "$1" "$2")
+  grep -q "^$1 $2 " $SETS 2>/dev/null || echo "$1 $2 $old" >> $SETS
+  settings put "$1" "$2" "$3"
+}
+
+case "${1:-status}" in
+on)
+  disable_pkgs $TIER_A
+  # Animasyon yok (daha az GPU/CPU), ekran 30 sn'de kapansin, otomatik parlaklik.
+  set_kv global window_animation_scale 0
+  set_kv global transition_animation_scale 0
+  set_kv global animator_duration_scale 0
+  set_kv system screen_off_timeout 30000
+  set_kv system screen_brightness_mode 1
+  # Kablosuz gereksizler: Bluetooth / NFC kapali (Wi-Fi'ya dokunulmaz).
+  cmd bluetooth_manager disable >/dev/null 2>&1 || svc bluetooth disable 2>/dev/null
+  svc nfc disable 2>/dev/null
+  # Arka planda kalan kisisel uygulamalar sunucuyla RAM yarismasin: yalniz onplandayken calissin.
+  for p in $(pm list packages -3 -e | sed 's/package://'); do
+    case "$p" in com.kabuk*|com.topjohnwu.magisk) continue;; esac
+    cmd appops set "$p" RUN_ANY_IN_BACKGROUND ignore 2>/dev/null && echo "$p" >> $BASE/servermode.bgrestricted
+  done
+  sort -u -o $BASE/servermode.bgrestricted $BASE/servermode.bgrestricted 2>/dev/null
+  echo "sunucu modu ACIK: $(wc -l < $LIST) uygulama kapali, $(wc -l < $BASE/servermode.bgrestricted 2>/dev/null) uygulama arka planda kisitli"
+  ;;
+extra)
+  shift; disable_pkgs "$@" ;;
+off)
+  [ -f $LIST ] && while read -r p; do pm enable --user 0 "$p" >/dev/null 2>&1 && echo "acildi: $p"; done < $LIST
+  [ -f $SETS ] && while read -r ns k v; do
+    if [ "$v" = null ]; then settings delete "$ns" "$k" >/dev/null; else settings put "$ns" "$k" "$v"; fi
+  done < $SETS
+  [ -f $BASE/servermode.bgrestricted ] && while read -r p; do cmd appops set "$p" RUN_ANY_IN_BACKGROUND allow 2>/dev/null; done < $BASE/servermode.bgrestricted
+  # isaret dosyalari (ornek: LSPosed modulu 'disable') -> sil
+  [ -f $BASE/servermode.files ] && while read -r f; do rm -f "$f" && echo "geri alindi: $f"; done < $BASE/servermode.files
+  rm -f $LIST $SETS $BASE/servermode.bgrestricted $BASE/servermode.files
+  echo "sunucu modu KAPALI: her sey eski haline dondu (Bluetooth/NFC'yi elle acabilirsin)"
+  ;;
+status)
+  echo "kapali uygulama: $(wc -l < $LIST 2>/dev/null || echo 0)"
+  [ -f $SETS ] && sed 's/^/eski ayar: /' $SETS
+  ;;
+esac

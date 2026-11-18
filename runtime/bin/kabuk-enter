@@ -1,0 +1,4 @@
+#!/system/bin/sh
+# kabuk-enter [kullanici]  -> mount'lari idempotent kurar, chroot'a girer,
+# cikista (icerde baska surec yoksa) mount'lari kaldirir.
+exec /system/bin/sh "$(dirname "$0")/kabuk" enter "$@"
