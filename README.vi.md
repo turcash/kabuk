@@ -74,6 +74,10 @@ runtime/         cây được triển khai vào /data/kabuk
   rootfs/        tiện ích chroot + agent (server.js, index.html, presets.json)
   sv/            định nghĩa dịch vụ runit
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 kiến trúc … 12 quyết định thiết kế
 ```
 

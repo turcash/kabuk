@@ -75,6 +75,10 @@ runtime/         дерево, которое разворачивается в 
   rootfs/        помощники chroot + агент (server.js, index.html, presets.json)
   sv/            определения сервисов runit
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 архитектура … 12 проектные решения
 ```
 

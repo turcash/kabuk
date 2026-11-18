@@ -75,6 +75,10 @@ runtime/         el árbol que se despliega en /data/kabuk
   rootfs/        ayudantes del chroot + agente (server.js, index.html, presets.json)
   sv/            definiciones de servicio runit
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 arquitectura … 12 decisiones de diseño
 ```
 

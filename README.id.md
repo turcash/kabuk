@@ -74,6 +74,10 @@ runtime/         pohon yang dipasang ke /data/kabuk
   rootfs/        pembantu chroot + agen (server.js, index.html, presets.json)
   sv/            definisi layanan runit
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 arsitektur … 12 keputusan desain
 ```
 

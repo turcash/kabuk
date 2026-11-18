@@ -73,6 +73,10 @@ runtime/         الشجرة التي تُنشر في /data/kabuk
   rootfs/        مساعدات chroot + الوكيل (server.js، index.html، presets.json)
   sv/            تعريفات خدمات runit
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 البنية … 12 قرارات التصميم
 ```
 

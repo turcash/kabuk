@@ -104,6 +104,10 @@ runtime/         the tree that is deployed to /data/kabuk
   rootfs/        chroot helpers + the agent (server.js, index.html, presets.json)
   sv/            runit service definitions
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 architecture … 12 design decisions
 ```
 
@@ -133,6 +137,14 @@ relay. Everything goes through your Tailscale tailnet, and the agent
 re-authorises each request against the tailnet owner. The chroot is a packaging
 boundary, not a sandbox — read [docs/07-security.md](docs/07-security.md) before
 enabling `FULL_ROOT=1` or the agent's `full` permission mode.
+
+## Source note
+
+The Android apps' Kotlin sources and their git history were lost to an
+accidental directory deletion. The released APKs survived, so the classes were
+recovered with `jadx` and published under `apps/*/recovered-java/`; behaviour is
+identical, the code is mechanical. The runtime, the agent and the documentation
+are the original, current sources.
 
 ## License
 

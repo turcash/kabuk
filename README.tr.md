@@ -103,6 +103,10 @@ runtime/         /data/kabuk altına kurulan ağaç
   rootfs/        chroot yardımcıları + ajan (server.js, index.html, presets.json)
   sv/            runit servis tanımları
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 mimari … 12 tasarım kararları
 ```
 

@@ -73,6 +73,10 @@ runtime/         部署到 /data/kabuk 的目录树
   rootfs/        chroot 辅助脚本 + Agent (server.js, index.html, presets.json)
   sv/            runit 服务定义
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 架构 … 12 设计决策
 ```
 

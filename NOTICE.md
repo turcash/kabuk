@@ -3,24 +3,20 @@
 Kabuk itself is MIT (see `LICENSE`). It builds on, embeds or installs the
 following components. Nothing here is relicensed.
 
-## Referenced but not distributed
+## Bundled in this repository
 
-The Android client and server apps are not part of this repository; their design
-is documented in `docs/09-client-app.md` and `docs/10-server-app.md`. A client
-build links against the following components, which keep their own licenses:
+| Component | Where | License |
+|---|---|---|
+| Termux `terminal-view` / `terminal-emulator` | inside the client APK (`apps/prebuilt/`, referenced from `apps/client`) | Apache-2.0 |
+| `mosh-client` static binary | inside the client APK | GPL-3.0 |
+| `ssh` (OpenSSH static binary) | inside the client APK | BSD-style (OpenSSH) |
+| musl `ld.so` | inside the client APK (`libldmusl.so`) | MIT |
+| `fakepw.c` shim | client native source (original work, no external code) | MIT (this project) |
 
-| Component | License |
-|---|---|
-| Termux `terminal-view` / `terminal-emulator` | Apache-2.0 |
-| `mosh-client` static binary | GPL-3.0 |
-| `ssh` (OpenSSH static binary) | BSD-style (OpenSSH) |
-| musl `ld.so` (`libldmusl.so`) | MIT |
-
-The `fakepw.c` libc shim used by the client is original work under MIT. If you
-redistribute a modified client build that includes GPL-3.0 `mosh-client`, you
-must comply with the GPL for that binary; the corresponding source is available
-from <https://mosh.org> and from the Alpine/musl static build recipe used to
-produce it.
+Because the client APK ships GPL-3.0 `mosh-client`, the corresponding source is
+available from <https://mosh.org> (and from the Alpine/musl static build recipe
+used to produce the binary). If you redistribute a modified build, you must
+comply with the GPL for that binary.
 
 ## Installed on the device at runtime (not redistributed here)
 

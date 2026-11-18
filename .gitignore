@@ -16,8 +16,6 @@ keystore.properties
 
 # Runtime state if someone copies a phone directory here by accident
 /rootfs/
-/apps/
-/apps/prebuilt/
 backups/
 *.log
 boot.log

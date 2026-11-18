@@ -74,6 +74,10 @@ runtime/         जो /data/kabuk में तैनात होता ह�
   rootfs/        chroot हेल्पर + एजेंट (server.js, index.html, presets.json)
   sv/            runit सेवा परिभाषाएँ
   tests/         stage2.sh
+apps/
+  client/        recovered Java (client)
+  server/        recovered Java (server)
+  prebuilt/      signed APK + SHA-256
 docs/            01 आर्किटेक्चर … 12 डिज़ाइन निर्णय
 ```
 
