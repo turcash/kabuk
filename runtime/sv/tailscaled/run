@@ -1,0 +1,14 @@
+#!/bin/sh
+# Tailscale daemonu. TS_MODE=tun (varsayilan, gercek tailscale0 arayuzu) | userspace.
+# --netfilter-mode yok: 'tailscale up --netfilter-mode=off' ile Android iptables'ina dokunmaz;
+# guvenlik duvari kabuk tarafindan (KABUK_IN zinciri) kurulur.
+exec 2>&1
+. /etc/kabuk/env
+mkdir -p /var/lib/tailscale /run/tailscale
+if [ "$TS_MODE" = userspace ]; then
+  set -- --tun=userspace-networking
+else
+  set -- --tun=tailscale0
+fi
+exec tailscaled --state=/var/lib/tailscale/tailscaled.state \
+  --socket=/run/tailscale/tailscaled.sock --port=41641 "$@"
