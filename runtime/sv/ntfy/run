@@ -1,0 +1,10 @@
+#!/bin/sh
+# Kendi barindirilan ntfy: YALNIZ tailnet adresinde (veri tailnet disina cikmaz).
+exec 2>&1
+. /etc/kabuk/env
+mkdir -p /var/lib/ntfy
+if [ "$TS_MODE" = userspace ]; then ip=127.0.0.1
+else until ip=$(kabuk-tsip 4) && [ -n "$ip" ]; do sleep 3; done; fi
+exec ntfy serve --listen-http "$ip:${NTFY_PORT:-8090}" --base-url "http://$ip:${NTFY_PORT:-8090}" \
+  --cache-file /var/lib/ntfy/cache.db --cache-duration 48h \
+  --behind-proxy=false --log-level warn
