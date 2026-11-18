@@ -5,8 +5,11 @@ panel: it owns no daemon, holds no state, and does nothing that the CLI cannot
 do. Its whole job is to deploy the runtime, ask Magisk for root, run a command
 and show the output.
 
-> **Not distributed here.** The app binaries and their sources are not part of
-> this repository; this chapter documents the design of the shipped build.
+Prebuilt: `apps/prebuilt/kabuk-server-1.0.0.apk`.
+
+> **Source note.** As with the client, the Kotlin sources were lost and
+> `apps/server/recovered-java/` holds the app classes recovered from the
+> released APK. Behaviour matches the shipped build.
 
 ## Why an app at all
 

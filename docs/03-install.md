@@ -14,7 +14,7 @@ picture.
 
 ## 1. Guided install (Kabuk Server app)
 
-1. Install the Kabuk Server app (see [10-server-app.md](10-server-app.md)).
+1. Install `apps/prebuilt/kabuk-server-1.0.0.apk`.
 2. Open it and grant the Magisk root prompt (permanently).
 3. Tap **Kur / Onar** (*Install / Repair*). The app then, in order:
    * extracts `assets/{bin,magisk,etc,sv,rootfs,tests}` into its cache directory,
@@ -116,7 +116,7 @@ listens outside loopback/tailnet.
 
 ## 6. Client app
 
-Install the Kabuk Client app (see [09-client-app.md](09-client-app.md)) on the device you type on. Add a
+Install `apps/prebuilt/kabuk-client-1.1.1.apk` on the device you type on. Add a
 profile with host `note10`, user `dev` and your key; the client opens a mosh
 or ssh session and keeps several tabs. See [09-client-app.md](09-client-app.md).
 

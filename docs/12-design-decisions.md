@@ -167,13 +167,13 @@ were Turkish and were translated.
 `kabuk deploy` puts on the phone, including `sv/` and `rootfs/opt/kabuk-agent/`,
 so the repository is the source of truth rather than an illustration of it.
 
-**The Android app sources are not published.** An accidental case-insensitive
-directory deletion removed the Gradle project and its `.git`. The built apps used
-a personal package id, and a decompiled copy would carry it unchanged, so neither
-the binaries nor the recovered classes are part of this release. Their design,
-behaviour and layout are documented in [09-client-app.md](09-client-app.md) and
-[10-server-app.md](10-server-app.md). The runtime, the agent and this
-documentation are the original, current sources.
+**Lost sources are published as recovered Java, clearly labelled.** An
+accidental case-insensitive directory deletion removed the Gradle project and
+its `.git`. Rather than silently shipping only binaries, the classes were
+recovered from the released APKs with `jadx` and published under
+`apps/*/recovered-java/`, with the original Kotlin layout documented. The APKs
+themselves are in `apps/prebuilt/`. Anyone rebuilding from here gets the same
+behaviour, mechanical code and missing comments included.
 
 ## What was rejected
 

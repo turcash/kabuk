@@ -3,8 +3,13 @@
 Package `com.kabuk`. A terminal for the phone-server: it opens mosh or ssh
 sessions, keeps several tabs, and has a built-in web view for the agent UI.
 
-> **Not distributed here.** The app binaries and their sources are not part of
-> this repository; this chapter documents the design of the shipped build.
+Prebuilt: `apps/prebuilt/kabuk-client-1.1.1.apk`.
+
+> **Source note.** The original Kotlin sources were lost to an accidental
+> directory deletion. `apps/client/recovered-java/` contains the app classes
+> recovered from the released APK with `jadx`, which is why some constructs look
+> mechanical (`Runnable` lambdas, synthetic `$` classes, no comments). Behaviour
+> is identical to the shipped build. See [12-design-decisions.md](12-design-decisions.md).
 
 ## No root, no Termux
 

@@ -119,6 +119,10 @@ runtime/                 everything that ends up on the phone
   rootfs/opt/kabuk-agent/ Node chat server + single-page UI
   sv/<service>/run       runit service definitions
   tests/stage2.sh        on-device regression checks
+apps/
+  client/recovered-java  Kabuk Client, recovered from the released APK
+  server/recovered-java  Kabuk Server, recovered from the released APK
+  prebuilt/              signed APKs
 docs/                    this documentation
 ```
 
