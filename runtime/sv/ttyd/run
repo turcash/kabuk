@@ -1,0 +1,13 @@
+#!/bin/sh
+# Web terminali: yalniz tailnet arayuzunde, temel kimlik dogrulamali, 'claude' tmux oturumu.
+exec 2>&1
+. /etc/kabuk/env
+cred=$(cat /etc/kabuk/ttyd.cred 2>/dev/null)
+[ -n "$cred" ] || { echo "ttyd.cred yok"; sleep 30; exit 1; }
+if [ "$TS_MODE" = userspace ]; then iface=lo
+else
+  until [ -n "$(kabuk-tsip 4)" ]; do sleep 3; done
+  iface=tailscale0
+fi
+exec ttyd -i "$iface" -p "${TTYD_PORT:-7681}" -c "$cred" -W -t titleFixed=note10 \
+  su -l dev -c 'exec kabuk-session'
