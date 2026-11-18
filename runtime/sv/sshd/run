@@ -1,0 +1,15 @@
+#!/bin/sh
+# OpenSSH: yalniz anahtar, yalniz dev, YALNIZ tailnet adresinde dinler (LAN/internet kapali).
+exec 2>&1
+. /etc/kabuk/env
+[ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A
+mkdir -p /var/empty
+if [ -n "$SSH_LISTEN" ]; then
+  set -- -o "ListenAddress=$SSH_LISTEN"
+else
+  # tailscale0 adresi gelene kadar bekle (tailnet disinda asla dinleme).
+  until v4=$(kabuk-tsip 4) && [ -n "$v4" ]; do sleep 3; done
+  v6=$(kabuk-tsip 6)
+  set -- -o "ListenAddress=$v4" ${v6:+-o "ListenAddress=[$v6]"}
+fi
+exec /usr/sbin/sshd -D -e "$@"
