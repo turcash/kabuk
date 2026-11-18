@@ -1,0 +1,30 @@
+# Build artefacts
+.gradle/
+build/
+*/build/
+dist/
+
+# Machine-specific
+local.properties
+*.iml
+.idea/
+
+# Signing material — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# Runtime state if someone copies a phone directory here by accident
+/rootfs/
+/apps/
+/apps/prebuilt/
+backups/
+*.log
+boot.log
+health.csv
+DISABLED
+ttyd.cred
+
+# OS noise
+.DS_Store
+Thumbs.db
