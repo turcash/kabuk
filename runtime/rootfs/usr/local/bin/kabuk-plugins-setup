@@ -1,0 +1,31 @@
+#!/bin/sh
+# Claude Code eklenti/skill kurulumu (dev olarak). Tekrar calistirmak guvenli.
+#   kabuk-plugins-setup markets   -> RTK + pazarlari ekle, icerikleri listele
+#   kabuk-plugins-setup install <plugin@pazar ...>
+set -u
+step=${1:-markets}; [ $# -gt 0 ] && shift
+case "$step" in
+markets)
+  echo "== RTK (Rust Token Killer)"
+  if ! command -v rtk >/dev/null || ! rtk gain >/dev/null 2>&1; then
+    d=$(mktemp -d) && cd "$d" &&
+    curl -fsSL -o rtk.tgz https://github.com/rtk-ai/rtk/releases/download/v1.2.0/rtk-aarch64-unknown-linux-musl.tar.gz &&
+    tar -xzf rtk.tgz && b=$(find . -type f -name rtk | head -1) && install -m 755 "$b" ~/.local/bin/rtk && cd / && rm -rf "$d"
+  fi
+  rtk --version
+  echo "== pazarlar"
+  for m in JuliusBrussee/caveman anthropics/skills obra/superpowers-marketplace wshobson/agents raintree-technology/apple-hig-skills; do
+    claude plugin marketplace add "$m" >/dev/null 2>&1 && echo "eklendi: $m" || echo "EKLENEMEDI: $m"
+  done
+  for f in ~/.claude/plugins/marketplaces/*/.claude-plugin/marketplace.json; do
+    mk=$(jq -r .name "$f"); [ "$mk" = claude-plugins-official ] && continue
+    echo "--- $mk: $(jq '.plugins|length' "$f") eklenti"
+    jq -r '.plugins[] | "  " + .name + "  " + ((.description // "")[0:60])' "$f"
+  done ;;
+install)
+  ok=0; bad=0
+  for p in "$@"; do
+    if claude plugin install "$p" >/dev/null 2>&1; then ok=$((ok+1)); else bad=$((bad+1)); echo "KURULAMADI: $p"; fi
+  done
+  echo "kuruldu: $ok, hata: $bad" ;;
+esac

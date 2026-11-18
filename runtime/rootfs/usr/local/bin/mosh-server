@@ -1,0 +1,10 @@
+#!/bin/sh
+# mosh-server sarmalayicisi: UDP soketini YALNIZ tailnet adresine bagla (LAN'a port acma).
+# mosh istemcisi ssh uzerinden 'mosh-server new ...' calistirir; PATH'te /usr/local/bin once gelir.
+if [ "${1:-}" = new ]; then
+  case " $* " in *" -i "*) ;; *)
+    ip=$(kabuk-tsip 4) || { echo "mosh: tailscale0 adresi yok" >&2; exit 1; }
+    shift; set -- new -i "$ip" "$@" ;;
+  esac
+fi
+exec /usr/bin/mosh-server "$@"

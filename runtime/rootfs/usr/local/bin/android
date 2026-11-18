@@ -1,0 +1,18 @@
+#!/bin/sh
+# Android (host) tarafinda ROOT olarak komut calistir (yalniz FULL_ROOT=1 iken; sudo gerekir).
+#   android getprop ro.product.model
+#   android pm list packages -3
+#   android               -> etkilesimli Android kabugu
+# Nasil: chroot icindeki root, /proc/1/root (init'in koku = gercek Android) uzerine chroot eder;
+# surec Magisk SELinux baglaminda calistigi icin Android araclari (pm, settings, cmd) calisir.
+if [ "$(id -u)" != 0 ]; then
+  exec sudo -n "$0" "$@" 2>/dev/null || { echo "android: tam yetki kapali (FULL_ROOT=0) ya da sudo yok" >&2; exit 1; }
+fi
+ENV="PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
+HOME=/data/local/tmp TMPDIR=/data/local/tmp ANDROID_ROOT=/system ANDROID_DATA=/data ANDROID_STORAGE=/storage
+ANDROID_ART_ROOT=/apex/com.android.art ANDROID_I18N_ROOT=/apex/com.android.i18n ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
+TERM=${TERM:-xterm}"
+if [ $# -eq 0 ]; then
+  exec chroot /proc/1/root /system/bin/env -i $ENV /system/bin/sh
+fi
+exec chroot /proc/1/root /system/bin/env -i $ENV /system/bin/sh -c "$*"

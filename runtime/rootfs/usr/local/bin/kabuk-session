@@ -1,0 +1,9 @@
+#!/bin/sh
+# Kullanim: kabuk-session [oturum]   (varsayilan: claude)
+# -u: tmux istemciyi UTF-8 kabul etsin. Olmazsa (mosh/ssh ortaminda locale algilanamazsa)
+# tmux her UTF-8 karakteri '_' ile degistirir (Turkce harfler, cerceve cizgileri bozulur).
+export LANG=${LANG:-C.UTF-8} LC_CTYPE=C.UTF-8
+s=${1:-claude}
+tmux -u has-session -t "$s" 2>/dev/null || tmux -u new-session -d -s "$s" -c "$HOME"
+[ -n "${TMUX:-}" ] && exec tmux -u switch-client -t "$s"
+exec tmux -u attach-session -t "$s"

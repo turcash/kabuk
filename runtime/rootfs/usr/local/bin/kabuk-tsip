@@ -1,0 +1,8 @@
+#!/bin/sh
+# tailscale0 adresi: kabuk-tsip 4 | 6   (yoksa bos, cikis 1)
+if [ "${1:-4}" = 6 ]; then
+  a=$(ip -6 addr show dev tailscale0 2>/dev/null | awk '/inet6 fd7a/{sub(/\/.*/,"",$2);print $2;exit}')
+else
+  a=$(ip -4 addr show dev tailscale0 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2);print $2;exit}')
+fi
+[ -n "$a" ] && echo "$a"

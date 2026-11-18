@@ -1,0 +1,28 @@
+#!/bin/sh
+# Claude Code hook'u -> tailnet icindeki ntfy -> Kabuk istemcisi.
+# Kullanim (hook): kabuk-notify notification|stop   (stdin: hook JSON)
+#          elle : echo '{"message":"deneme"}' | kabuk-notify test
+kind=${1:-test}
+json=$(cat 2>/dev/null)
+[ -n "$json" ] || json='{}'
+ip=$(kabuk-tsip 4) || ip=127.0.0.1
+url=${KABUK_NTFY_URL:-http://$ip:8090/kabuk}
+cwd=$(printf '%s' "$json" | jq -r '.cwd // empty' 2>/dev/null)
+proj=$(basename "${cwd:-$HOME}")
+case "$kind" in
+  notification)
+    ntype=$(printf '%s' "$json" | jq -r '.notification_type // empty' 2>/dev/null)
+    msg=$(printf '%s' "$json" | jq -r '.message // "Claude Code dikkatini istiyor"' 2>/dev/null)
+    title="note10 · $proj: ${ntype:-bildirim}"
+    prio=high; tags=bell ;;
+  stop)
+    msg=$(printf '%s' "$json" | jq -r '(.last_assistant_message // "Is bitti") | .[0:300]' 2>/dev/null)
+    title="note10 · $proj: bitti"
+    prio=default; tags=white_check_mark ;;
+  *)
+    msg=$(printf '%s' "$json" | jq -r '.message // "deneme"' 2>/dev/null)
+    title="note10 · deneme"; prio=default; tags=test_tube ;;
+esac
+curl -fsS -m 5 -o /dev/null -H "Title: $title" -H "Priority: $prio" -H "Tags: $tags" \
+  --data-binary "$msg" "$url" 2>/dev/null
+exit 0   # hook asla Claude Code'u bloklamasin
